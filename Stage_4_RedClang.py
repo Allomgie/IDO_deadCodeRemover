@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+--- Work in Progress! ---
 Stage 4: Clang-delta reducer — OPTIMISED VERSION with TCC fast-reject guard.
 
 Hybrid approach: Python passes first (fast, TCC-guarded),
