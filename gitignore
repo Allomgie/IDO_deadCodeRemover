@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Pipeline outputs / datasets (generated, not source)
+dataset_Stage_1/
+dataset_Stage_2/
+dataset_Stage_3/
+dataset_Stage_4/
+dataset/
+
+# Logs
+*.jsonl
+*.log
+
+# Temp files from reducer runs
+tmp/
+temp/
+/dev/shm/delta_*/
+/dev/shm/sem_*/
+/dev/shm/tr_*/
+/dev/shm/cr_*/
+
+# IDO compiler artifacts (proprietary, not redistributable)
+*.o
+*.obj
+*.elf
+CompilerRoot/tools/ido/
+
+# OS
+.DS_Store
+Thumbs.db
