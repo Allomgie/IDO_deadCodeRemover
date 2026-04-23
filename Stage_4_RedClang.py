@@ -37,9 +37,7 @@ TMP_ROOT     = "/dev/shm"
 CLANG_DELTA  = "/usr/local/bin/clang_delta"
 
 GROUPS = [
-    "Save_00_generated", "Save_01_handwritten", "Save_02_original",
-    "Save_03_Torture", "Save_04_YARPGen", "Save_05_csmith",
-    "Save_06_csmith_switchCase",
+    "Input_Group"
 ]
 INCLUDE_DIRS = [
     os.path.join(PROJECT_ROOT, "include"),
