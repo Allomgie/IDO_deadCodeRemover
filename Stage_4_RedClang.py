@@ -13,8 +13,7 @@ Key optimisations:
   5. Gatekeeper: decides whether Clang-delta is needed at all
   6. count('\n') instead of splitlines()
 
-Input:  dataset/TokenReduced/
-Output: dataset/ClangReduced/
+
 """
 
 import os, sys, re, subprocess, signal, tempfile, shutil, hashlib
