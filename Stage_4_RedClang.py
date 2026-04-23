@@ -30,8 +30,8 @@ PROJECT_ROOT = os.path.join(BASE_DIR, "IDO_compiler")
 IDO_DIR      = os.path.abspath(os.path.join(PROJECT_ROOT, "tools", "ido"))
 
 DATASET_DIR  = os.path.join(BASE_DIR, "dataset")
-INPUT_DIR    = os.path.join(BASE_DIR, "TokenReduced")
-OUTPUT_DIR   = os.path.join(BASE_DIR, "ClangReduced")
+INPUT_DIR    = os.path.join(BASE_DIR, "dataset_Stage_3")
+OUTPUT_DIR   = os.path.join(BASE_DIR, "dataset_Stage_4")
 OBJDUMP      = "mips-linux-gnu-objdump"
 TMP_ROOT     = "/dev/shm"
 CLANG_DELTA  = "/usr/local/bin/clang_delta"
