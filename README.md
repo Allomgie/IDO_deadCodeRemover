@@ -24,7 +24,7 @@ Stage 0: Roher C-Code (Input)
     ↓
 Stage 1: AST-Level Delta Debugging ─────┐
     ↓                                   │
-Stage 2: Semantische Expression-Clean  │
+Stage 2: Semantische Expression-Clean   │
     ↓                                   ├── Compiler-Orakel (IDO → objdump → Hash)
 Stage 3: Token-Level Reduktion ─────────┤
     ↓                                   │
