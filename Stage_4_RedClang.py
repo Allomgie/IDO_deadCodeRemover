@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
---- Work in Progress! ---
 Stage 4: Clang-delta reducer — OPTIMISED VERSION with TCC fast-reject guard.
 
 Hybrid approach: Python passes first (fast, TCC-guarded),
@@ -13,6 +12,10 @@ Key optimisations:
   4. Corrected Python passes (remove-unused-function, return-void, neutralize-calls)
   5. Gatekeeper: decides whether Clang-delta is needed at all
   6. count('\n') instead of splitlines()
+  7. FIXED: pass_simplify_if now preserves block braces
+  8. FIXED: header handling like Stage 3 (never attach includes to PP code)
+  9. FIXED: multi-pass for Python passes
+  10. FIXED: pass_simplify_comma no longer matches every bracket
 
 
 """
@@ -23,20 +26,21 @@ from datetime import datetime
 from tqdm import tqdm
 
 BASE_DIR     = "/home/user/deadCodeRemover"
-PROJECT_ROOT = os.path.join(BASE_DIR, "CompilerRoot")
+PROJECT_ROOT = os.path.join(BASE_DIR, "IDO_compiler")
 IDO_DIR      = os.path.abspath(os.path.join(PROJECT_ROOT, "tools", "ido"))
-IDO_CC       = os.path.join(IDO_DIR, "cc")
 
-INPUT_DIR    = os.path.join(BASE_DIR, "dataset_Stage_3")
-OUTPUT_DIR   = os.path.join(BASE_DIR, "dataset_Stage_4")
+DATASET_DIR  = os.path.join(BASE_DIR, "dataset")
+INPUT_DIR    = os.path.join(BASE_DIR, "TokenReduced")
+OUTPUT_DIR   = os.path.join(BASE_DIR, "ClangReduced")
 OBJDUMP      = "mips-linux-gnu-objdump"
 TMP_ROOT     = "/dev/shm"
 CLANG_DELTA  = "/usr/local/bin/clang_delta"
 
 GROUPS = [
-    "Input_Group",
+    "Save_00_generated", "Save_01_handwritten", "Save_02_original",
+    "Save_03_Torture", "Save_04_YARPGen", "Save_05_csmith",
+    "Save_06_csmith_switchCase",
 ]
-
 INCLUDE_DIRS = [
     os.path.join(PROJECT_ROOT, "include"),
     os.path.join(PROJECT_ROOT, "src"),
@@ -69,7 +73,6 @@ def tcc_syntax_check(c_source: str, tmp_dir: str, header_dir: str) -> bool:
     """
     Fast syntax check using TCC.
     Returns True if TCC passes without errors.
-    Uses subprocess.call with DEVNULL to avoid OS pipe overhead.
     Timeout: 5 seconds (TCC is extremely fast).
     """
     c_path = os.path.join(tmp_dir, "_tcc.c")
@@ -82,7 +85,6 @@ def tcc_syntax_check(c_source: str, tmp_dir: str, header_dir: str) -> bool:
         if header_dir:
             cmd += ["-I", header_dir]
         cmd += [c_path]
-        # Routing STDOUT and STDERR to DEVNULL eliminates pipe overhead entirely
         rc = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         return rc == 0
     except subprocess.TimeoutExpired:
@@ -109,7 +111,6 @@ class CompileCache:
         self._tcc_rejected = set()
         self._tcc_baseline_ok = tcc_baseline_ok and _tcc_available()
 
-        # Statistics counters
         self.stats = {
             "cache_hits": 0,
             "tcc_checks": 0,
@@ -205,7 +206,7 @@ def is_syntactically_plausible(src: str) -> bool:
     return True
 
 # =====================================================================
-#  INFRASTRUKTUR
+#  INFRASTRUCTURE
 # =====================================================================
 
 def run_cmd_safely(cmd, cwd=None, env=None, timeout=30):
@@ -384,7 +385,6 @@ def has_declarations(src: str) -> bool:
 
 def has_function_definitions(src: str) -> bool:
     """Checks whether remove-unused-function is applicable."""
-    # Search for 'name(args) {' patterns
     return bool(re.search(r'\b\w+\s*\([^)]*\)\s*\{', src))
 
 def has_function_calls(src: str) -> bool:
@@ -426,7 +426,8 @@ def is_worth_clang(src: str) -> tuple[bool, str]:
 
 def pass_simplify_if(src: str, baseline: str, tmp_dir: str, header_dir: str,
                      cache: CompileCache, pass_name: str = "simplify-if") -> tuple[str, bool]:
-    """Python port of simplify-if with aggressive and conservative modes."""
+    """Python port of simplify-if. Preserves curly braces to avoid
+    destroying block semantics (especially with multiple statements)."""
     if not has_if_blocks(src):
         return src, False
 
@@ -441,7 +442,8 @@ def pass_simplify_if(src: str, baseline: str, tmp_dir: str, header_dir: str,
         for match in reversed(matches):
             open_p = match.end() - 1
             close_p = _find_matching(src, open_p, '(', ')')
-            if close_p == -1: continue
+            if close_p == -1:
+                continue
 
             cond = src[open_p+1:close_p]
             after_if = src[close_p+1:].lstrip()
@@ -450,12 +452,11 @@ def pass_simplify_if(src: str, baseline: str, tmp_dir: str, header_dir: str,
 
             open_b = src.find('{', close_p)
             close_b = _find_matching(src, open_b, '{', '}')
-            if close_b == -1: continue
-
-            true_body = src[open_b+1:close_b]
+            if close_b == -1:
+                continue
 
             # Cache key for this if-block
-            ctx_key = hashlib.md5(f"if|{cond}|{true_body[:50]}".encode()).hexdigest()
+            ctx_key = hashlib.md5(f"if|{cond}|{src[open_b:close_b+1]}".encode()).hexdigest()
             if ctx_key in fail_cache:
                 continue
 
@@ -468,33 +469,44 @@ def pass_simplify_if(src: str, baseline: str, tmp_dir: str, header_dir: str,
                 if after_else.startswith('{'):
                     open_else_b = src.find('{', else_start)
                     close_else_b = _find_matching(src, open_else_b, '{', '}')
-                    if close_else_b == -1: continue
+                    if close_else_b == -1:
+                        continue
 
-                    false_body = src[open_else_b+1:close_else_b]
-
-                    # Candidate 1: keep ONLY the true branch
-                    cand_true = src[:match.start()] + true_body + src[close_else_b+1:]
+                    # Candidate 1: keep ONLY the true branch (WITH braces)
+                    cand_true = src[:match.start()] + src[open_b:close_b+1] + src[close_else_b+1:]
                     h, _ = cache.try_candidate(cand_true, tmp_dir, header_dir, baseline, pass_name)
                     if h == baseline:
-                        src = cand_true; changed = True; made_progress = True; break
+                        src = cand_true
+                        changed = True
+                        made_progress = True
+                        break
 
-                    # Candidate 2: keep ONLY the false branch
-                    cand_false = src[:match.start()] + false_body + src[close_else_b+1:]
+                    # Candidate 2: keep ONLY the false branch (WITH braces)
+                    cand_false = src[:match.start()] + src[open_else_b:close_else_b+1] + src[close_else_b+1:]
                     h, _ = cache.try_candidate(cand_false, tmp_dir, header_dir, baseline, pass_name)
                     if h == baseline:
-                        src = cand_false; changed = True; made_progress = True; break
+                        src = cand_false
+                        changed = True
+                        made_progress = True
+                        break
             else:
-                # Aggressive: if(cond){body} -> body
-                cand_agg = src[:match.start()] + true_body + src[close_b+1:]
+                # Aggressive: if(cond){body} -> {body}
+                cand_agg = src[:match.start()] + src[open_b:close_b+1] + src[close_b+1:]
                 h, _ = cache.try_candidate(cand_agg, tmp_dir, header_dir, baseline, pass_name)
                 if h == baseline:
-                    src = cand_agg; changed = True; made_progress = True; break
+                    src = cand_agg
+                    changed = True
+                    made_progress = True
+                    break
 
-                # Conservative: if(cond){body} -> cond; body
-                cand_clang = src[:match.start()] + cond + ";" + true_body + src[close_b+1:]
+                # Conservative: if(cond){body} -> cond; {body}
+                cand_clang = src[:match.start()] + cond + ";" + src[open_b:close_b+1] + src[close_b+1:]
                 h, _ = cache.try_candidate(cand_clang, tmp_dir, header_dir, baseline, pass_name)
                 if h == baseline:
-                    src = cand_clang; changed = True; made_progress = True; break
+                    src = cand_clang
+                    changed = True
+                    made_progress = True
+                    break
 
             if not made_progress:
                 fail_cache.add(ctx_key)
@@ -537,7 +549,10 @@ def pass_remove_unused_var(src: str, baseline: str, tmp_dir: str, header_dir: st
                     continue
                 h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
                 if h == baseline:
-                    src = candidate; changed = True; made_progress = True; break
+                    src = candidate
+                    changed = True
+                    made_progress = True
+                    break
                 else:
                     fail_cache.add(ctx_key)
                 continue
@@ -554,7 +569,10 @@ def pass_remove_unused_var(src: str, baseline: str, tmp_dir: str, header_dir: st
 
                 h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
                 if h == baseline:
-                    src = candidate; changed = True; made_progress = True; break
+                    src = candidate
+                    changed = True
+                    made_progress = True
+                    break
                 else:
                     fail_cache.add(ctx_key)
 
@@ -574,12 +592,10 @@ def pass_remove_unused_function(src: str, baseline: str, tmp_dir: str, header_di
         return src, False
 
     changed = False
-    # Collect ALL function definitions
     func_pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
     fail_cache = set()
 
     for _iteration in range(20):
-        # Find all definitions
         defined = {}
         for match in func_pattern.finditer(src):
             name = match.group(1)
@@ -601,11 +617,9 @@ def pass_remove_unused_function(src: str, baseline: str, tmp_dir: str, header_di
 
         made_progress = False
 
-        # Sort by position (back to front)
         for func_name in sorted(defined.keys(), key=lambda n: defined[n][0], reverse=True):
             start_pos, end_pos = defined[func_name]
 
-            # Check: is the function called OUTSIDE its own definition?
             call_pattern = re.compile(rf'\b{re.escape(func_name)}\s*\(')
             used_elsewhere = False
             for call_match in call_pattern.finditer(src):
@@ -616,7 +630,6 @@ def pass_remove_unused_function(src: str, baseline: str, tmp_dir: str, header_di
             if used_elsewhere:
                 continue
 
-            # Find the start of the return type
             type_start = start_pos
             while type_start > 0 and src[type_start-1] not in ';{}':
                 type_start -= 1
@@ -628,7 +641,10 @@ def pass_remove_unused_function(src: str, baseline: str, tmp_dir: str, header_di
             candidate = src[:type_start] + src[end_pos+1:]
             h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
             if h == baseline:
-                src = candidate; changed = True; made_progress = True; break
+                src = candidate
+                changed = True
+                made_progress = True
+                break
             else:
                 fail_cache.add(ctx_key)
 
@@ -640,13 +656,16 @@ def pass_remove_unused_function(src: str, baseline: str, tmp_dir: str, header_di
 
 def pass_simplify_comma(src: str, baseline: str, tmp_dir: str, header_dir: str,
                         cache: CompileCache, pass_name: str = "simplify-comma") -> tuple[str, bool]:
-    """Python port of SimplifyCommaExpr."""
+    """Python port of SimplifyCommaExpr. Only matches comma expressions."""
     if not has_comma_expressions(src):
         return src, False
 
     changed = False
-    pattern = re.compile(r'\(')
     fail_cache = set()
+
+    # Match brackets that contain commas but are NOT control structures
+    # Negative lookbehind: no if/for/while/switch/return directly before
+    pattern = re.compile(r'(?<![a-zA-Z_0-9])\(')
 
     for _iteration in range(10):
         matches = list(pattern.finditer(src))
@@ -673,7 +692,10 @@ def pass_simplify_comma(src: str, baseline: str, tmp_dir: str, header_dir: str,
 
             h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
             if h == baseline:
-                src = candidate; changed = True; made_progress = True; break
+                src = candidate
+                changed = True
+                made_progress = True
+                break
             else:
                 fail_cache.add(ctx_key)
 
@@ -685,13 +707,18 @@ def pass_simplify_comma(src: str, baseline: str, tmp_dir: str, header_dir: str,
 
 def pass_neutralize_calls(src: str, baseline: str, tmp_dir: str, header_dir: str,
                           cache: CompileCache, pass_name: str = "neutralize-calls") -> tuple[str, bool]:
-    """Corrected version with more robust context check."""
+    """Corrected version with more robust context check and macro blacklist."""
     if not has_function_calls(src):
         return src, False
 
     changed = False
     pattern = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(')
     fail_cache = set()
+
+    # YARPGen / CSmith macros that are not real function calls
+    macro_blacklist = {"min", "max", "safe_add", "safe_sub", "safe_mul", "safe_div",
+                       "safe_mod", "safe_lshift", "safe_rshift", "safe_unary_minus",
+                       "safe_mod_func_uint32_t_u_u"}
 
     for _iteration in range(20):
         matches = list(pattern.finditer(src))
@@ -701,31 +728,25 @@ def pass_neutralize_calls(src: str, baseline: str, tmp_dir: str, header_dir: str
             func_name = match.group(1)
             if func_name in {"main", "if", "while", "for", "switch", "sizeof"}:
                 continue
+            if func_name in macro_blacklist:
+                continue
 
             open_p = match.end() - 1
             close_p = _find_matching(src, open_p, '(', ')')
-            if close_p == -1: continue
+            if close_p == -1:
+                continue
 
-            # Context analysis
             before = src[match.start()-1] if match.start() > 0 else ''
             after = src[close_p+1] if close_p+1 < len(src) else ''
 
-            # Determine allowed replacements based on context
             replacements = []
 
-            # Standalone statement: func(); -> ;
             if before in ';{}' and after == ';':
                 replacements.extend([";", "(void)0;"])
-
-            # In assignment: x = func(); -> x = 0;
             if before == '=':
                 replacements.extend(["0", "(void)0"])
-
-            # In condition: if(func()) -> if(0)
             if before == '(':
                 replacements.extend(["0", "1"])
-
-            # In argument list: foo(func()) -> foo(0)
             if before == ',':
                 replacements.extend(["0"])
 
@@ -741,7 +762,10 @@ def pass_neutralize_calls(src: str, baseline: str, tmp_dir: str, header_dir: str
 
                 h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
                 if h == baseline:
-                    src = candidate; changed = True; made_progress = True; break
+                    src = candidate
+                    changed = True
+                    made_progress = True
+                    break
                 else:
                     fail_cache.add(ctx_key)
 
@@ -772,38 +796,36 @@ def pass_return_void(src: str, baseline: str, tmp_dir: str, header_dir: str,
 
         open_p = match.end() - 1
         close_p = _find_matching(src, open_p, '(', ')')
-        if close_p == -1: continue
+        if close_p == -1:
+            continue
 
         after_args = src[close_p+1:].lstrip()
-        if not after_args.startswith('{'): continue
+        if not after_args.startswith('{'):
+            continue
 
         open_b = src.find('{', close_p)
         close_b = _find_matching(src, open_b, '{', '}')
-        if close_b == -1: continue
+        if close_b == -1:
+            continue
 
-        # Find return type
         type_start = match.start()
         while type_start > 0 and src[type_start-1] not in ';{}':
             type_start -= 1
 
         type_prefix = src[type_start:match.start()].strip()
-        if "void" in type_prefix: continue
+        if "void" in type_prefix:
+            continue
 
         body = src[open_b+1:close_b]
 
-        # Check return statements
         ret_pattern = re.compile(r'\breturn\b\s*([^;]*);')
-
-        # Collect all return statements
         returns = list(ret_pattern.finditer(body))
         if not returns:
             continue
 
-        # Check whether all returns are side-effect-free
         all_safe = True
         for ret_match in returns:
             expr = ret_match.group(1).strip()
-            # Heuristic: function calls = side effects
             if re.search(r'\b\w+\s*\(', expr):
                 all_safe = False
                 break
@@ -813,10 +835,8 @@ def pass_return_void(src: str, baseline: str, tmp_dir: str, header_dir: str,
             continue
 
         if all_safe:
-            # Aggressive: return expr; -> ;
             new_body = ret_pattern.sub(r';', body)
         else:
-            # Conservative: return expr; -> expr;
             new_body = ret_pattern.sub(r'\1;', body)
 
         new_header = "void " + src[match.start():open_b+1]
@@ -824,7 +844,8 @@ def pass_return_void(src: str, baseline: str, tmp_dir: str, header_dir: str,
 
         h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
         if h == baseline:
-            src = candidate; changed = True
+            src = candidate
+            changed = True
         else:
             fail_cache.add(ctx_key)
 
@@ -842,26 +863,36 @@ def preprocess_file(c_filepath, header_dir, tmp_dir):
     c_path = os.path.join(tmp_dir, "src.c")
     pp_path = os.path.join(tmp_dir, "pp.c")
 
-    with open(c_path, "w") as f: f.write(fixed_src)
+    with open(c_path, "w") as f:
+        f.write(fixed_src)
 
     cmd = ["gcc", "-E", "-P", "-xc", "-D_LANGUAGE_C", "-D_MIPS_SZLONG=32"]
-    for inc in INCLUDE_DIRS: cmd += ["-I", inc]
-    if header_dir: cmd += ["-I", header_dir]
+    for inc in INCLUDE_DIRS:
+        cmd += ["-I", inc]
+    if header_dir:
+        cmd += ["-I", header_dir]
     cmd += [c_path, "-o", pp_path]
 
-    try: rc, _, _ = run_cmd_safely(cmd, timeout=30)
-    except subprocess.TimeoutExpired: return None
-    try: os.unlink(c_path)
-    except: pass
-    if rc != 0: return None
+    try:
+        rc, _, _ = run_cmd_safely(cmd, timeout=30)
+    except subprocess.TimeoutExpired:
+        return None
+    try:
+        os.unlink(c_path)
+    except:
+        pass
+    if rc != 0:
+        return None
     return pp_path
 
 
 def run_clang_transform(pp_path, transformation, counter, tmp_dir):
     """Runs a clang_delta transformation."""
     out_path = os.path.join(tmp_dir, "cd_out.c")
-    try: os.unlink(out_path)
-    except OSError: pass
+    try:
+        os.unlink(out_path)
+    except OSError:
+        pass
 
     cmd = [CLANG_DELTA,
            f"--transformation={transformation}",
@@ -883,7 +914,6 @@ def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=Fal
     changed_total = False
     current_size = os.path.getsize(pp_path)
 
-    # Only aggregate-to-scalar
     transforms = ["aggregate-to-scalar"]
 
     cycle_iterations = 0
@@ -893,7 +923,8 @@ def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=Fal
     while cycle_changed and cycle_iterations < max_cycles:
         cycle_iterations += 1
         cycle_changed = False
-        if verbose: print(f"\n  === Clang Cycle {cycle_iterations} ===")
+        if verbose:
+            print(f"\n  === Clang Cycle {cycle_iterations} ===")
 
         for transform in transforms:
             counter = 1
@@ -902,14 +933,16 @@ def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=Fal
             while True:
                 out = run_clang_transform(pp_path, transform, counter, tmp_dir)
                 if out is None:
-                    break 
+                    break
 
                 out_size = os.path.getsize(out)
                 if out_size == current_size:
                     with open(pp_path, "rb") as f1, open(out, "rb") as f2:
                         if f1.read() == f2.read():
-                            try: os.unlink(out)
-                            except: pass
+                            try:
+                                os.unlink(out)
+                            except:
+                                pass
                             counter += 1
                             continue
 
@@ -922,8 +955,10 @@ def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=Fal
                     cycle_changed = True
                     changed_total = True
                 else:
-                    try: os.unlink(out)
-                    except: pass
+                    try:
+                        os.unlink(out)
+                    except:
+                        pass
                     counter += 1
 
             if verbose:
@@ -933,7 +968,8 @@ def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=Fal
                 else:
                     print(f"    [{transform}] no change")
 
-    if verbose: print(f"\n  Clang pipeline stabilised after {cycle_iterations} cycles.")
+    if verbose:
+        print(f"\n  Clang pipeline stabilised after {cycle_iterations} cycles.")
     return changed_total
 
 
@@ -949,23 +985,37 @@ def compute_asm_hash_from_pp(pp_path, tmp_dir, local_cache=None):
     o_path = os.path.join(tmp_dir, "clang_test.o")
 
     def _rm(p):
-        try: os.unlink(p)
-        except OSError: pass
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
     try:
         cmd = [IDO_CC, "-c", "-O2", "-mips2", "-G", "0", "-w", pp_path, "-o", o_path]
-        try: rc, _, _ = run_cmd_safely(cmd, cwd=tmp_dir, env=_IDO_ENV, timeout=30)
-        except subprocess.TimeoutExpired: _rm(o_path); return None
-        if rc != 0: _rm(o_path); return None
+        try:
+            rc, _, _ = run_cmd_safely(cmd, cwd=tmp_dir, env=_IDO_ENV, timeout=30)
+        except subprocess.TimeoutExpired:
+            _rm(o_path)
+            return None
+        if rc != 0:
+            _rm(o_path)
+            return None
 
         cmd_text = [OBJDUMP, "-d", "-z", o_path]
-        try: rc, stdout_text, _ = run_cmd_safely(cmd_text, timeout=30)
-        except subprocess.TimeoutExpired: _rm(o_path); return None
-        if rc != 0: _rm(o_path); return None
+        try:
+            rc, stdout_text, _ = run_cmd_safely(cmd_text, timeout=30)
+        except subprocess.TimeoutExpired:
+            _rm(o_path)
+            return None
+        if rc != 0:
+            _rm(o_path)
+            return None
 
         cmd_data = [OBJDUMP, "-s", "-j", ".rodata", "-j", ".data", "-j", ".bss", o_path]
-        try: rc2, stdout_data, _ = run_cmd_safely(cmd_data, timeout=30)
-        except subprocess.TimeoutExpired: stdout_data = b""
+        try:
+            rc2, stdout_data, _ = run_cmd_safely(cmd_data, timeout=30)
+        except subprocess.TimeoutExpired:
+            stdout_data = b""
 
         _rm(o_path)
 
@@ -973,9 +1023,11 @@ def compute_asm_hash_from_pp(pp_path, tmp_dir, local_cache=None):
 
         for line in stdout_text.decode(errors="replace").splitlines():
             m = re.match(r'^\s*[0-9a-fA-F]+:\s+[0-9a-fA-F]+\s+(.*)', line)
-            if not m: continue
+            if not m:
+                continue
             s = m.group(1).strip().split('#')[0].strip()
-            if not s: continue
+            if not s:
+                continue
             s = re.sub(r'addiu\s+\$?sp,\s*\$?sp,\s*-?\d+', 'addiu sp,sp,OFFSET', s)
             s = re.sub(r'-?\d+\(\$?sp\)', 'OFFSET(sp)', s)
             s = re.sub(r'-?\d+\(\$?fp\)', 'OFFSET(fp)', s)
@@ -989,15 +1041,18 @@ def compute_asm_hash_from_pp(pp_path, tmp_dir, local_cache=None):
                     asm_payload.append("DATA:" + m.group(1).strip())
 
         if not asm_payload:
-            if local_cache is not None: local_cache[text_hash] = None
+            if local_cache is not None:
+                local_cache[text_hash] = None
             return None
 
         h = hashlib.md5("\n".join(asm_payload).encode()).hexdigest()
-        if local_cache is not None: local_cache[text_hash] = h
+        if local_cache is not None:
+            local_cache[text_hash] = h
         return h
 
     except Exception:
-        _rm(o_path); return None
+        _rm(o_path)
+        return None
 
 
 def compute_asm_hash_from_source(c_source, tmp_dir, header_dir):
@@ -1012,29 +1067,204 @@ def compute_asm_hash_from_source(c_source, tmp_dir, header_dir):
 
     def _cleanup():
         for p in [c_path, i_path]:
-            try: os.unlink(p)
-            except OSError: pass
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
     try:
-        with open(c_path, "w") as f: f.write(fixed)
+        with open(c_path, "w") as f:
+            f.write(fixed)
         cmd = ["gcc", "-E", "-P", "-xc", "-D_LANGUAGE_C", "-D_MIPS_SZLONG=32"]
-        for inc in INCLUDE_DIRS: cmd += ["-I", inc]
-        if header_dir: cmd += ["-I", header_dir]
+        for inc in INCLUDE_DIRS:
+            cmd += ["-I", inc]
+        if header_dir:
+            cmd += ["-I", header_dir]
         cmd += [c_path, "-o", i_path]
-        try: rc, _, _ = run_cmd_safely(cmd, timeout=30)
-        except subprocess.TimeoutExpired: _cleanup(); return None, "gcc timeout"
-        try: os.unlink(c_path)
-        except: pass
-        if rc != 0: _cleanup(); return None, "gcc fail"
+        try:
+            rc, _, _ = run_cmd_safely(cmd, timeout=30)
+        except subprocess.TimeoutExpired:
+            _cleanup()
+            return None, "gcc timeout"
+        try:
+            os.unlink(c_path)
+        except:
+            pass
+        if rc != 0:
+            _cleanup()
+            return None, "gcc fail"
 
         h = compute_asm_hash_from_pp(i_path, tmp_dir)
-        try: os.unlink(i_path)
-        except: pass
-        if h: _asm_cache[cache_key] = h
+        try:
+            os.unlink(i_path)
+        except:
+            pass
+        if h:
+            _asm_cache[cache_key] = h
         return h, ("" if h else "compile fail")
     except Exception as e:
-        _cleanup(); return None, str(e)
+        _cleanup()
+        return None, str(e)
 
+
+
+
+def pass_min_max_identity(src: str, baseline: str, tmp_dir: str, header_dir: str,
+                          cache: CompileCache, pass_name: str = "min_max_identity") -> tuple[str, bool]:
+    """
+    min(x, x) -> x, max(x, x) -> x.
+    Operates at text level BEFORE macro expansion.
+    """
+    changed = False
+    pattern = re.compile(r'\b(min|max)\s*\(')
+    fail_cache = set()
+
+    while True:
+        matches = list(pattern.finditer(src))
+        made_progress = False
+
+        for match in reversed(matches):
+            open_p = match.end() - 1
+            close_p = _find_matching(src, open_p, '(', ')')
+            if close_p == -1:
+                continue
+
+            args_str = src[open_p+1:close_p]
+            args = _split_args(args_str)
+            if len(args) != 2:
+                continue
+
+            # Normalise whitespace for comparison
+            arg1_norm = re.sub(r'\s+', '', args[0])
+            arg2_norm = re.sub(r'\s+', '', args[1])
+
+            if arg1_norm != arg2_norm:
+                continue
+
+            ctx_key = hashlib.md5(f"minmax_id|{match.start()}|{arg1_norm}".encode()).hexdigest()
+            if ctx_key in fail_cache:
+                continue
+
+            # min(x, x) -> x  (keep the first argument)
+            candidate = src[:match.start()] + args[0] + src[close_p+1:]
+
+            h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
+            if h == baseline:
+                src = candidate
+                changed = True
+                made_progress = True
+                break
+            else:
+                fail_cache.add(ctx_key)
+
+        if not made_progress:
+            break
+
+    return src, changed
+
+
+def pass_ternary_identical(src: str, baseline: str, tmp_dir: str, header_dir: str,
+                           cache: CompileCache, pass_name: str = "ternary_identical") -> tuple[str, bool]:
+    """
+    cond ? a : a -> a  (simple cases only, no nested ternaries).
+    """
+    changed = False
+    fail_cache = set()
+
+    # Match cond ? expr1 : expr2 where expr1/expr2 contain no ?
+    pattern = re.compile(r'([^?]+)\?([^?:]+):([^?;\)]+)')
+
+    while True:
+        matches = list(pattern.finditer(src))
+        made_progress = False
+
+        for match in reversed(matches):
+            true_branch = match.group(2).strip()
+            false_branch = match.group(3).strip()
+
+            if re.sub(r'\s+', '', true_branch) != re.sub(r'\s+', '', false_branch):
+                continue
+
+            ctx_key = hashlib.md5(f"tern_id|{match.start()}|{true_branch}".encode()).hexdigest()
+            if ctx_key in fail_cache:
+                continue
+
+            candidate = src[:match.start()] + true_branch + src[match.end():]
+
+            h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
+            if h == baseline:
+                src = candidate
+                changed = True
+                made_progress = True
+                break
+            else:
+                fail_cache.add(ctx_key)
+
+        if not made_progress:
+            break
+
+    return src, changed
+
+
+def pass_dead_store(src: str, baseline: str, tmp_dir: str, header_dir: str,
+                    cache: CompileCache, pass_name: str = "dead_store") -> tuple[str, bool]:
+    """
+    Removes assignments 'var = expr;' when:
+      - var does not appear in expr (no self-reference)
+      - var is never read after the assignment
+      - the line is not a declaration (e.g. int x = 5;)
+
+    This is the killer pass for YARPGen code with unused global assignments.
+    """
+    changed = False
+    type_keywords = re.compile(
+        r'^(\s*)(int|char|short|long|unsigned|signed|float|double|void|'
+        r'struct|union|enum|static|extern|const|volatile|register|inline|'
+        r'typedef|auto|restrict)\b'
+    )
+
+    # Pattern: identifier = expr;  (no ==, +=, etc.)
+    assign_pattern = re.compile(r'(?<![a-zA-Z0-9_])([a-zA-Z_][a-zA-Z0-9_]*)\s*=[^=;]+;')
+
+    while True:
+        matches = list(assign_pattern.finditer(src))
+        made_progress = False
+
+        for match in reversed(matches):
+            var_name = match.group(1)
+            full_match = match.group(0)
+
+            # 1. Check whether the line is a declaration
+            line_start = src.rfind('\n', 0, match.start()) + 1
+            line = src[line_start:match.end()]
+            if type_keywords.match(line):
+                continue
+
+            # 2. Check whether var appears in the RHS (self-reference)
+            rhs_start = match.start() + match.group(0).index('=') + 1
+            rhs = src[rhs_start:match.end() - 1]  # without trailing ';'
+            if re.search(rf'\b{re.escape(var_name)}\b', rhs):
+                continue
+
+            # 3. Check whether var is still read after the assignment
+            rest = src[match.end():]
+            if re.search(rf'\b{re.escape(var_name)}\b', rest):
+                continue
+
+            # Candidate: remove entire line
+            candidate = src[:line_start] + src[match.end():]
+
+            h, _ = cache.try_candidate(candidate, tmp_dir, header_dir, baseline, pass_name)
+            if h == baseline:
+                src = candidate
+                changed = True
+                made_progress = True
+                break
+
+        if not made_progress:
+            break
+
+    return src, changed
 
 # =====================================================================
 #  MAIN FUNCTION PER FILE
@@ -1047,7 +1277,7 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
     """
     global _asm_cache
     if len(_asm_cache) > 10000:
-        _asm_cache.clear()   
+        _asm_cache.clear()
 
     result = {"file": c_filepath, "status": "clean",
               "original_lines": 0, "reduced_lines": 0, "error": None,
@@ -1059,24 +1289,17 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
     original_src = re.sub(r'#include\s+"[^"]*?([^/"]+\.h)"', r'#include "\1"', original_src)
     result["original_lines"] = original_src.count('\n') + (1 if original_src and not original_src.endswith('\n') else 0)
 
-    # Remember include lines
-    include_lines = []
-    for line in original_src.splitlines():
-        if re.match(r'^\s*#\s*include', line):
-            include_lines.append(line)
-
     tmp_dir = tempfile.mkdtemp(dir=TMP_ROOT, prefix="cr_")
     try:
-        # Baseline
         baseline, err = compute_asm_hash_from_source(original_src, tmp_dir, header_dir)
         if baseline is None:
             result["status"] = "error"
             result["error"] = f"Baseline does not compile: {err}"
             return result
         if dry_run:
-            result["status"] = "would_reduce"; return result
+            result["status"] = "would_reduce"
+            return result
 
-        # TCC baseline check
         tcc_baseline_ok = False
         if _tcc_available():
             tcc_baseline_ok = tcc_syntax_check(original_src, tmp_dir, header_dir)
@@ -1095,70 +1318,100 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
         total_changed = False
 
         # === PYTHON PASSES (fast, TCC-guarded) ===
-        if verbose: print("\n  === Python passes ===")
-
+        # FIXED: multi-pass instead of single pass
         passes = [
+            ("min_max_identity", pass_min_max_identity),
+            ("ternary_identical", pass_ternary_identical),
             ("simplify-if", pass_simplify_if),
             ("remove-unused-var", pass_remove_unused_var),
             ("remove-unused-func", pass_remove_unused_function),
             ("simplify-comma", pass_simplify_comma),
             ("neutralize-calls", pass_neutralize_calls),
             ("return-void", pass_return_void),
+            ("dead_store", pass_dead_store),
         ]
 
-        for pass_name, pass_func in passes:
-            new_src, changed = pass_func(src, baseline, tmp_dir, header_dir, cache, pass_name)
-            if changed:
-                src = new_src
-                total_changed = True
+        max_python_passes = 5
+        for pass_round in range(max_python_passes):
+            round_changed = False
+            if verbose:
+                print(f"\n  === Python Passes Round {pass_round + 1} ===")
+
+            for pass_name, pass_func in passes:
+                new_src, changed = pass_func(src, baseline, tmp_dir, header_dir, cache, pass_name)
+                if changed:
+                    src = new_src
+                    total_changed = True
+                    round_changed = True
+                    if verbose:
+                        lines = src.count('\n') + (1 if src and not src.endswith('\n') else 0)
+                        print(f"    [{pass_name}] -> {lines} lines")
+                elif verbose:
+                    print(f"    [{pass_name}] no change")
+
+            if not round_changed:
                 if verbose:
-                    lines = src.count('\n') + (1 if src and not src.endswith('\n') else 0)
-                    print(f"    [{pass_name}] -> {lines} lines")
-            elif verbose:
-                print(f"    [{pass_name}] no change")
+                    print(f"  Python passes stable after {pass_round + 1} rounds.")
+                break
 
         needs_clang, reason = is_worth_clang(src)
 
         if not needs_clang:
-            if verbose: print(f"\n  Gatekeeper: Clang not needed ({reason})")
+            if verbose:
+                print(f"\n  Gatekeeper: Clang not needed ({reason})")
         else:
-            if verbose: print(f"\n  Gatekeeper: Clang needed ({reason})")
+            if verbose:
+                print(f"\n  Gatekeeper: Clang needed ({reason})")
 
-            # Pre-process fuer clang_delta
-            pp_path = preprocess_file(c_filepath, header_dir, tmp_dir)
-            if pp_path is None:
-                result["status"] = "error"
-                result["error"] = "Preprocessing failed"
-                # Append statistics if possible
-                result["compiler_stats"] = cache.stats
-                return result
+            # FIXED: Stage-3 style: try on original source first
+            src_copy = os.path.join(tmp_dir, "src_for_clang.c")
+            with open(src_copy, "w") as f:
+                f.write(src)
 
+            pp_path = src_copy
             local_cache = {}
             changed = apply_clang_passes(pp_path, baseline, tmp_dir, local_cache, verbose)
 
             if changed:
                 total_changed = True
-                # Safety check
-                final_hash = compute_asm_hash_from_pp(pp_path, tmp_dir, local_cache)
-                if final_hash != baseline:
+                with open(pp_path) as f:
+                    src = f.read()
+                if verbose:
+                    print("  Clang on original source succeeded")
+            else:
+                # Fallback: preprocessed only for complex cases (macros etc.)
+                if verbose:
+                    print("  Clang on original source failed, trying preprocessed...")
+                pp_path = preprocess_file(c_filepath, header_dir, tmp_dir)
+                if pp_path is None:
                     result["status"] = "error"
-                    result["error"] = f"Final hash mismatch"
+                    result["error"] = "Preprocessing failed"
                     result["compiler_stats"] = cache.stats
                     return result
 
-                with open(pp_path) as f:
-                    src = f.read()
-                if include_lines:
-                    src = "\n".join(include_lines) + "\n" + src
+                changed = apply_clang_passes(pp_path, baseline, tmp_dir, local_cache, verbose)
+
+                if changed:
+                    total_changed = True
+                    final_hash = compute_asm_hash_from_pp(pp_path, tmp_dir, local_cache)
+                    if final_hash != baseline:
+                        result["status"] = "error"
+                        result["error"] = "Final hash mismatch"
+                        result["compiler_stats"] = cache.stats
+                        return result
+
+                    with open(pp_path) as f:
+                        src = f.read()
+                    if verbose:
+                        print("  Clang on preprocessed source succeeded (output is PP code)")
 
         result["reduced_lines"] = src.count('\n') + (1 if src and not src.endswith('\n') else 0)
-
-        # Append statistics to result
         result["compiler_stats"] = cache.stats
 
         if total_changed and (result["reduced_lines"] < result["original_lines"] or len(src) < len(original_src)):
             result["status"] = "reduced"
-            with open(output_path, "w") as f: f.write(src)
+            with open(output_path, "w") as f:
+                f.write(src)
         else:
             result["status"] = "clean"
             shutil.copy2(c_filepath, output_path)
@@ -1166,8 +1419,8 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
         return result
 
     except Exception as e:
-        result["status"] = "error"; result["error"] = str(e)
-        # Append statistics if cache exists
+        result["status"] = "error"
+        result["error"] = str(e)
         if 'cache' in locals():
             result["compiler_stats"] = cache.stats
         return result
@@ -1181,8 +1434,10 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
 
 def _worker_init():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    try: resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    except: pass
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except:
+        pass
 
 def _worker_fn(args):
     c_filepath, output_path, dry_run = args
@@ -1213,14 +1468,17 @@ def main():
         os.makedirs(output_dir, exist_ok=True)
         g = next((g for g in GROUPS if g in c), "")
         if g:
-            od = os.path.join(output_dir, g); os.makedirs(od, exist_ok=True)
+            od = os.path.join(output_dir, g)
+            os.makedirs(od, exist_ok=True)
             op = os.path.join(od, os.path.basename(c))
-        else: op = os.path.join(output_dir, os.path.basename(c))
+        else:
+            op = os.path.join(output_dir, os.path.basename(c))
 
         print(f"=== CLANG-REDUCE: {c} ===\n")
         res = reduce_file(c, hd, op, verbose=True)
         print(f"\nStatus: {res['status']}")
-        if res.get('error'): print(f"Error: {res['error']}")
+        if res.get('error'):
+            print(f"Error: {res['error']}")
         sv = res['original_lines'] - res['reduced_lines']
         print(f"Original:  {res['original_lines']} lines")
         print(f"Reduced:   {res['reduced_lines']} lines")
@@ -1228,7 +1486,6 @@ def main():
         if res['original_lines'] > 0:
             print(f"Saved:     {sv} lines ({sv/res['original_lines']*100:.1f}%)")
 
-        # Compiler diagnostics output
         if "compiler_stats" in res:
             cs = res["compiler_stats"]
             print("\n--- Compiler diagnostics ---")
@@ -1238,42 +1495,49 @@ def main():
 
         if res['status'] == 'reduced':
             print("\n--- Reduced code ---")
-            with open(op) as f: print(f.read())
+            with open(op) as f:
+                print(f.read())
         return
 
     groups = GROUPS if not args.group else [args.group]
     if args.group and args.group not in GROUPS:
-        print(f"Error: group '{args.group}' not found."); sys.exit(1)
+        print(f"Error: group '{args.group}' not found.")
+        sys.exit(1)
     os.makedirs(output_dir, exist_ok=True)
 
     total_count, skipped = 0, 0
     for group in groups:
         gi, go = os.path.join(input_dir, group), os.path.join(output_dir, group)
-        if not os.path.isdir(gi): continue
+        if not os.path.isdir(gi):
+            continue
         os.makedirs(go, exist_ok=True)
         for e in os.scandir(gi):
             if e.name.endswith(".c") and e.is_file():
                 if not args.overwrite and os.path.exists(os.path.join(go, e.name)):
                     skipped += 1
-                else: total_count += 1
+                else:
+                    total_count += 1
 
     print(f"Found: {total_count+skipped} | Skipped: {skipped} | To process: {total_count}")
     print(f"TCC Guard: {'available' if _tcc_available() else 'NOT available'}")
     print(f"Worker: {num_workers}")
     print(f"Input:  {input_dir}\nOutput: {output_dir}")
-    if total_count == 0: print("Nothing to do."); return
+    if total_count == 0:
+        print("Nothing to do.")
+        return
 
     def _gen():
         for group in groups:
             gi, go = os.path.join(input_dir, group), os.path.join(output_dir, group)
-            if not os.path.isdir(gi): continue
+            if not os.path.isdir(gi):
+                continue
             for e in os.scandir(gi):
                 if e.name.endswith(".c") and e.is_file():
                     op = os.path.join(go, e.name)
-                    if not args.overwrite and os.path.exists(op): continue
+                    if not args.overwrite and os.path.exists(op):
+                        continue
                     yield (e.path, op, args.dry_run)
 
-    # Startup cleanup
     try:
         now = time.time()
         for d in os.scandir(TMP_ROOT):
@@ -1281,8 +1545,10 @@ def main():
                 try:
                     if now - d.stat().st_mtime > 300:
                         shutil.rmtree(d.path, ignore_errors=True)
-                except: pass
-    except: pass
+                except:
+                    pass
+    except:
+        pass
 
     stats = {"clean": 0, "reduced": 0, "error": 0, "clang_skipped": 0}
     total_saved = 0
@@ -1298,13 +1564,18 @@ def main():
                     sv = res["original_lines"] - res["reduced_lines"]
                     if sv > 0 and res["status"] == "reduced":
                         total_saved += sv
-                        lf.write(json.dumps(res, ensure_ascii=False) + "\n"); lf.flush()
+                        lf.write(json.dumps(res, ensure_ascii=False) + "\n")
+                        lf.flush()
                     if res["status"] == "error":
                         ef.write(json.dumps({"timestamp": datetime.now().isoformat(),
                             "file": res["file"], "error": res.get("error")},
-                            ensure_ascii=False) + "\n"); ef.flush()
+                            ensure_ascii=False) + "\n")
+                        ef.flush()
             except KeyboardInterrupt:
-                print("\nAborted!"); pool.terminate(); pool.join(); sys.exit(1)
+                print("\nAborted!")
+                pool.terminate()
+                pool.join()
+                sys.exit(1)
 
     print("\n" + "=" * 60)
     print(f"  Clean: {stats['clean']} | Reduced: {stats['reduced']} | Errors: {stats['error']}")
