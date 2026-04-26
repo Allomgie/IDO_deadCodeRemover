@@ -45,7 +45,7 @@ Output: Minimal, compilable C code with identical MIPS assembly
 - **Parser:** pycparser with gcc -E preprocessing
 - **Strategy:** Systematic removal of AST nodes (statements, declarations, globals)
 - **Multi-pass:** Iterates until no further changes are possible (phantom code elimination)
-- **Safety:** Original files are never modified; results are written to `dataset_Stage_1/`
+- **Safety:** Original files are never modified; results are written to `Stage_1_OUT/`
 
 **Removes:**
 - Unreferenced global variables and forward declarations
@@ -54,7 +54,7 @@ Output: Minimal, compilable C code with identical MIPS assembly
 - Empty `while`/`if` blocks after inner reduction
 
 ### Stage 2 – Semantic Cleanup
-**`Stage_2_Semantics.py`**
+**`Stage_2_SEMANTIC.py`**
 
 - **Focus:** Expression-level rather than statement-level
 - **Rule-based:** 13 simplification rules, each validated against the compiler oracle
@@ -101,6 +101,9 @@ Hybrid approach: Python passes first (fast, TCC-guarded), then selective Clang-d
 - `simplify-comma` – `(a, b, c)` → `(b, c)` etc.
 - `neutralize-calls` – `foo()` → `0` / `;` depending on context
 - `return-void` – Return type relaxation for unused returns
+- `min_max_identity` – `min(x, x)` → `x`, `max(x, x)` → `x`
+- `ternary_identical` – `cond ? a : a` → `a`
+- `dead_store` – Removes unused global assignments (YARPGen-specific)
 
 **Clang-delta (only when needed):**
 - `aggregate-to-scalar` – Simplify struct/array accesses
@@ -158,7 +161,7 @@ addiu $sp, $sp, -48     →  addiu sp,sp,OFFSET
 pip install pycparser tqdm
 
 # IDO 5.3 compiler (not publicly available — requires own installation)
-# Expected at: /home/user/deadCodeRemover/CompilerRoot/tools/ido/
+# Expected at: /home/user/deadCodeRemover/IDO_Compiler/tools/ido/
 
 # MIPS objdump (Debian/Ubuntu)
 sudo apt-get install binutils-mips-linux-gnu
@@ -177,7 +180,7 @@ Paths must be adjusted to your local environment:
 ```python
 # In all stage scripts:
 BASE_DIR     = "/home/user/deadCodeRemover"           # Project root
-PROJECT_ROOT = os.path.join(BASE_DIR, "CompilerRoot") # IDO & headers
+PROJECT_ROOT = os.path.join(BASE_DIR, "IDO_Compiler") # IDO & headers
 IDO_DIR      = os.path.join(PROJECT_ROOT, "tools", "ido")
 ```
 
@@ -198,7 +201,7 @@ IDO_DIR      = os.path.join(PROJECT_ROOT, "tools", "ido")
 python Stage_1_AST.py --diagnose /path/to/input.c
 
 # Stage 2: Semantic checks
-python Stage_2_Semantics.py --diagnose /path/to/input.c
+python Stage_2_SEMANTIC.py --diagnose /path/to/input.c
 
 # Stage 3: Token reduction (verbose)
 python Stage_3_CRedPython.py --diagnose /path/to/input.c
@@ -210,10 +213,10 @@ python Stage_4_RedClang.py --diagnose /path/to/input.c
 ### Batch processing
 ```bash
 # Stage 1 (parallel, 8 workers)
-python Stage_1_AST.py -j 8 --group Input_Group
+python Stage_1_AST.py -j 8 --group Save_00_generated
 
 # Stage 2 (input = output of Stage 1)
-python Stage_2_Semantics.py -j 8
+python Stage_2_SEMANTIC.py -j 8
 
 # Stage 3
 python Stage_3_CRedPython.py -j 4  # CPU/2 recommended
@@ -225,30 +228,42 @@ python Stage_4_RedClang.py -j 4
 ### Full pipeline
 ```bash
 python Stage_1_AST.py -j $(nproc) && \
-python Stage_2_Semantics.py -j $(nproc) && \
+cp -r dataset/Stage_1_OUT/* dataset/Stage_2_IN/ && \
+python Stage_2_SEMANTIC.py -j $(nproc) && \
+cp -r dataset/Stage_2_OUT/* dataset/Stage_3_IN/ && \
 python Stage_3_CRedPython.py -j $(($(nproc)/2)) && \
+cp -r dataset/Stage_3_OUT/* dataset/Stage_4_IN/ && \
 python Stage_4_RedClang.py -j $(($(nproc)/2))
 ```
 
+> **Note:** It is recommended to run more than one full cycle. Stages 1, 2, and 4 may unlock new reductions after Stage 3 has removed token-level noise — and vice versa. Stage 3 is the most expensive pass, so a practical approach is to skip it in subsequent cycles if only Stage 1, 2, or 4 produced changes in the previous round.
+
 ---
+
 
 ## Project Structure
 
 ```
 deadCodeRemover/
-├── CompilerRoot/               # IDO 5.3 toolchain & project headers
+├── IDO_Compiler/               # IDO 5.3 toolchain & project headers
 │   ├── tools/ido/
 │   ├── include/
 │   └── src/
-├── dataset_Stage_0/            # Raw input
-│   ├── Input_Group/
-│   └── Input_Group_headers/
-├── dataset_Stage_1/            # AST-optimized
-├── dataset_Stage_2/            # Semantically cleaned
-├── dataset_Stage_3/            # Token-reduced
-├── dataset_Stage_4/            # Final (Clang hybrid)
+├── dataset/
+│   ├── Stage_0_headers/        # Header files for all groups
+│   │   ├── Input_Group_0_headers/
+│   │   ├── Input_Group_1_headers/
+│   │   └── ...
+│   ├── Stage_1_IN/             # Raw input (Stage 0 output)
+│   ├── Stage_1_OUT/            # AST-optimized
+│   ├── Stage_2_IN/             # → Stage_1_OUT
+│   ├── Stage_2_OUT/            # Semantically cleaned
+│   ├── Stage_3_IN/             # → Stage_2_OUT
+│   ├── Stage_3_OUT/            # Token-reduced
+│   ├── Stage_4_IN/             # → Stage_3_OUT
+│   └── Stage_4_OUT/            # Final (Clang hybrid)
 ├── Stage_1_AST.py              # AST delta debugging
-├── Stage_2_Semantics.py        # Expression cleaner
+├── Stage_2_SEMANTIC.py         # Expression cleaner
 ├── Stage_3_CRedPython.py       # Token reducer (TCC-optimized)
 ├── Stage_4_RedClang.py         # Clang-delta hybrid
 └── README.md
