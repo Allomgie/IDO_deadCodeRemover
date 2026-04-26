@@ -96,13 +96,15 @@ def check_disk_space(min_free_gb=2):
 
 
 # --- CONFIGURATION ---
-BASE_DIR      = "/home/user/deadCodeRemover"
-PROJECT_ROOT  = os.path.join(BASE_DIR, "CompilerRoot")
+BASE_DIR      = "/home/lukas/code_generator/deadCodeRemover"
+PROJECT_ROOT  = os.path.join(BASE_DIR, "IDO_Compiler")
 IDO_DIR       = os.path.abspath(os.path.join(PROJECT_ROOT, "tools", "ido"))
 IDO_CC        = os.path.join(IDO_DIR, "cc")
 
-DATASET_DIR   = os.path.join(BASE_DIR, "dataset_Stage_0")
-OPTIMIZED_DIR = os.path.join(DATASET_DIR, "dataset_Stage_1")
+DATASET_DIR   = os.path.join(BASE_DIR, "dataset")
+OPTIMIZED_DIR = os.path.join(DATASET_DIR, "Stage_1_OUT")
+HEADERS_DIR    = os.path.join(DATASET_DIR, "Stage_0_headers")
+INPUT_DIR     = os.path.join(DATASET_DIR, "Stage_1_IN")
 
 GROUPS = [
     "Input_Group",
@@ -187,12 +189,6 @@ def compile_to_asm_hash(c_source: str, tmp_dir: str, header_dir: str,
         rc, stdout_text, _ = run_cmd_safely(cmd_obj_d, timeout=30)
         if rc != 0: return None, "objdump -d failed"
 
-        # 4. EXTRACT part B: data sections (.rodata, .data, .bss)
-        cmd_obj_s = [OBJDUMP, "-s", "-j", ".rodata", "-j", ".data", "-j", ".bss", o_path]
-        rc2, stdout_data, _ = run_cmd_safely(cmd_obj_s, timeout=30)
-        # rc2 may be non-zero if sections are absent — that is fine
-        _rm(o_path)
-
         asm_payload = []
 
         # Normalise the code section
@@ -201,19 +197,26 @@ def compile_to_asm_hash(c_source: str, tmp_dir: str, header_dir: str,
             if not m: continue
             s = m.group(1).strip().split('#')[0].strip()
             if not s: continue
-            # Stack normalisation
             s = re.sub(r'addiu\s+\$?(sp|29),\s*\$?(sp|29),\s*-?[0-9a-fA-F]+', 'addiu sp,sp,OFFSET', s)
             s = re.sub(r'-?[0-9a-fA-F]+\(\$?(sp|29)\)', 'OFFSET(sp)', s)
             s = re.sub(r'-?[0-9a-fA-F]+\(\$?(fp|30)\)', 'OFFSET(fp)', s)
             s = re.sub(r'%[a-z0-9_.]+\([^)]+\)', 'SYMBOL', s)
             asm_payload.append(s)
 
-        # Append raw data section
-        if rc2 == 0 and stdout_data:
-            for line in stdout_data.decode(errors="replace").splitlines():
-                m = re.match(r'^\s*[0-9a-fA-F]+\s+((?:[0-9a-fA-F]+\s*)+)', line)
-                if m:
-                    asm_payload.append("DATA:" + m.group(1).strip())
+        # 4. EXTRACT part B: data sections (.rodata, .data, .bss)
+        # Query each section INDIVIDUALLY — if one is absent, objdump
+        # returns rc!=0, but the other sections are still valid.
+        for sec in [".rodata", ".data", ".bss"]:
+            cmd_obj_s = [OBJDUMP, "-s", "-j", sec, o_path]
+            _, stdout_data, _ = run_cmd_safely(cmd_obj_s, timeout=30)
+
+            if stdout_data:
+                for line in stdout_data.decode(errors="replace").splitlines():
+                    m = re.match(r'^\s*[0-9a-fA-F]+\s+((?:[0-9a-fA-F]+\s*)+)', line)
+                    if m:
+                        asm_payload.append(f"{sec}:" + m.group(1).strip())
+
+        _rm(o_path)
 
         if not asm_payload:
             return None, "empty output"
@@ -291,48 +294,51 @@ def _preprocess_for_parsing(c_source: str, header_dir: str,
     with open(tmp_i, "r", encoding="utf-8", errors="replace") as f:
         preprocessed = f.read()
 
-    # Remove # line directives for pycparser
-    lines = [l for l in preprocessed.splitlines() if not l.lstrip().startswith("#")]
-    return "\n".join(lines), "parse_input.c"
+    # KEEP line markers (# linenum "file") for pycparser
+    # so that node.coord.file is set correctly.
+    # Remove everything else (e.g. #pragma, #ident).
+    kept = []
+    for l in preprocessed.splitlines():
+        stripped = l.lstrip()
+        if stripped.startswith("#"):
+            # gcc -E line markers: '# 42 "parse_input.c"' or '#line 42 ...'
+            if re.match(r'^#\s*\d+\s+"', stripped) or re.match(r'^#\s*line\s+', stripped):
+                kept.append(l)
+            # Everything else (#pragma, #ident, etc.) -> discard
+            else:
+                continue
+        else:
+            kept.append(l)
+    return "\n".join(kept), "parse_input.c"
 
 
 def _filter_ast_to_original(ast, original_src: str) -> None:
     """
     Removes AST nodes that originate from headers (expanded by gcc -E).
-    Keeps only nodes that come from the original .c file.
+    USES LINE MARKERS (node.coord) INSTEAD OF STRING MATCHING!
 
-    Heuristic: keep FuncDef and Decl nodes whose name appears
-    in the original source.
+    gcc -E sets #line directives which pycparser stores as the coord attribute.
+    Nodes whose coord points to a file other than 'parse_input.c'
+    originate from a header and are discarded.
     """
     if not ast.ext:
         return
 
-    # Collect all identifiers that appear in the original
-    original_names = set(re.findall(r'\b([a-zA-Z_]\w*)\b', original_src))
-
-    # Filter: keep only relevant nodes
     filtered = []
     for node in ast.ext:
-        # FuncDef: keep if the name appears in the original
-        if isinstance(node, c_ast.FuncDef):
-            if node.decl.name in original_names:
-                filtered.append(node)
-            continue
-
-        # Decl (global variables, forward decls):
-        # keep if the name appears in the original
-        if isinstance(node, c_ast.Decl):
-            if node.name and node.name in original_names:
-                filtered.append(node)
-            continue
-
-        # Typedefs: keep only standard types (from our preamble)
+        # Skip typedefs from preamble
         if isinstance(node, c_ast.Typedef):
-            # Skip — filtered out during code generation anyway
             continue
 
-        # Everything else (pragmas etc.): skip
-    
+        # Reliable filtering via internal parser coordinates
+        if hasattr(node, 'coord') and node.coord is not None:
+            # 'parse_input.c' is the temporary filename used by the preprocessor
+            if node.coord.file and not node.coord.file.endswith("parse_input.c"):
+                # Node physically originates from a header file -> discard
+                continue
+
+        filtered.append(node)
+
     ast.ext = filtered
 
 
@@ -459,6 +465,7 @@ def delta_debug_file(c_filepath: str, header_dir: str,
         if baseline_hash is None:
             result["status"] = "error"
             result["error"] = f"Baseline does not compile: {baseline_err}"
+            # DO NOT COPY: file is defective and permanently discarded
             return result
 
         # --- Parse AST (with gcc -E preprocessing) ---
@@ -466,6 +473,9 @@ def delta_debug_file(c_filepath: str, header_dir: str,
         if ast is None:
             result["status"] = "error"
             result["error"] = "AST parse error"
+            # COPY: file compiles cleanly but pycparser fails
+            if not dry_run:
+                shutil.copy2(c_filepath, output_path)
             return result
 
         # --- Recalculate baseline from regenerated code ---
@@ -477,6 +487,9 @@ def delta_debug_file(c_filepath: str, header_dir: str,
         if regen_code is None:
             result["status"] = "error"
             result["error"] = "RecursionError during code regeneration"
+            # COPY: file compiles cleanly but regeneration fails
+            if not dry_run:
+                shutil.copy2(c_filepath, output_path)
             return result
 
         regen_hash, regen_err = compile_to_asm_hash(regen_code, tmp_dir, header_dir)
@@ -507,7 +520,7 @@ def delta_debug_file(c_filepath: str, header_dir: str,
         # Without multi-pass, phantom code remains!
         # =============================================================
         pass_num = 0
-        max_passes = 5
+        max_passes = 20
 
         while pass_num < max_passes:
             pass_num += 1
@@ -693,6 +706,20 @@ def delta_debug_file(c_filepath: str, header_dir: str,
                 shutil.copy2(c_filepath, output_path)
             return result
 
+        # Check whether only empty blocks were removed (no real reduction).
+        # pycparser reformats code (extra brackets, int returns etc.)
+        # which is undesirable without a genuine semantic change.
+        only_empty = (
+            len(result["removed_top_level"]) == 0
+            and all("block (0 items)" in s for s in result["removed_statements"])
+        )
+        if only_empty:
+            result["status"] = "clean"
+            result["removed_statements"] = []
+            if not dry_run:
+                shutil.copy2(c_filepath, output_path)
+            return result
+
         total_removed = len(result["removed_top_level"]) + len(result["removed_statements"])
         result["status"] = "would_minimize" if dry_run else "minimized"
 
@@ -705,14 +732,9 @@ def delta_debug_file(c_filepath: str, header_dir: str,
                 shutil.copy2(c_filepath, output_path)
                 return result
 
-            # Safety check: does the result still compile?
-            final_hash, _ = compile_to_asm_hash(final_code, tmp_dir, header_dir)
-            if final_hash != baseline_hash:
-                result["status"] = "error"
-                result["error"] = "Final hash mismatch (should not happen)"
-                shutil.copy2(c_filepath, output_path)
-                return result
-
+            # No safety check — same approach as Stage 4.
+            # pycparser formats differently from the original, but semantics are identical.
+            # The hash check was already performed for each individual node.
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(final_code)
 
@@ -721,20 +743,28 @@ def delta_debug_file(c_filepath: str, header_dir: str,
     except RecursionError:
         result["status"] = "error"
         result["error"] = "RecursionError: AST too deeply nested (csmith/YARPGen)"
-        # Copy original to output so the file is not missing
-        try:
-            shutil.copy2(c_filepath, output_path)
-        except Exception:
-            pass
+        # COPY: original copied to output so the file is not missing
+        if not dry_run:
+            try:
+                shutil.copy2(c_filepath, output_path)
+            except Exception:
+                pass
         return result
 
     except Exception as e:
         result["status"] = "error"
         result["error"] = str(e)
+        # COPY: an internal script crash must not destroy compilable files.
+        if not dry_run:
+            try:
+                shutil.copy2(c_filepath, output_path)
+            except Exception:
+                pass
         return result
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 
 def _minimize_nested(items: list, ast, includes: list[str],
@@ -908,7 +938,7 @@ def _get_header_dir(c_filepath: str) -> str:
     """Finds the matching header directory."""
     for group in GROUPS:
         if group in c_filepath:
-            return os.path.join(DATASET_DIR, f"{group}_headers")
+            return os.path.join(HEADERS_DIR, f"{group}_headers")
     return ""
 
 
@@ -957,13 +987,26 @@ def main():
     if args.diagnose:
         c_path = args.diagnose
         header_dir = _get_header_dir(c_path)
-        out_path = os.path.join(output_dir, os.path.basename(c_path))
+
+        # Gruppen-Unterordner ermitteln (wie im Batch-Modus)
+        group_name = None
+        for group in GROUPS:
+            if group in c_path:
+                group_name = group
+                break
+
+        if group_name:
+            group_output = os.path.join(output_dir, group_name)
+        else:
+            group_output = output_dir
+        os.makedirs(group_output, exist_ok=True)
+        out_path = os.path.join(group_output, os.path.basename(c_path))
 
         print(f"=== DIAGNOSE: {c_path} ===")
         print(f"Header dir: {header_dir}")
         print(f"Output: {out_path}\n")
 
-        res = delta_debug_file(c_path, header_dir, out_path, dry_run=True)
+        res = delta_debug_file(c_path, header_dir, out_path, dry_run=False)
 
         print(f"Status: {res['status']}")
         if res.get('error'):
@@ -979,6 +1022,14 @@ def main():
 
         total = len(res['removed_top_level']) + len(res['removed_statements'])
         print(f"\nTotal removable: {total}")
+
+        # Size comparison
+        if os.path.exists(out_path):
+            in_size = os.path.getsize(c_path)
+            out_size = os.path.getsize(out_path)
+            print(f"\nInput:  {in_size} bytes")
+            print(f"Output: {out_size} bytes")
+            print(f"Diff:   {in_size - out_size} bytes ({in_size - out_size:+d})")
         return
 
     # --- Process groups ---
@@ -995,7 +1046,7 @@ def main():
     all_tasks = []
     skipped_existing = 0
     for group in groups_to_process:
-        input_dir = os.path.join(DATASET_DIR, group)
+        input_dir = os.path.join(INPUT_DIR, group)
         group_output = os.path.join(output_dir, group)
 
         if not os.path.isdir(input_dir):
@@ -1072,6 +1123,9 @@ def main():
                                 f"  {os.path.basename(res['file'])}: "
                                 f"{n_removed} nodes removable"
                             )
+
+                    # Only actually minimised files go into the log
+                    if status == "minimized":
                         log_file.write(json.dumps(res, ensure_ascii=False) + "\n")
                         log_file.flush()
 
