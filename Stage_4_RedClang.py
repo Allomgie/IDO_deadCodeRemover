@@ -17,7 +17,8 @@ Key optimisations:
   9. FIXED: multi-pass for Python passes
   10. FIXED: pass_simplify_comma no longer matches every bracket
 
-
+Input:  dataset/TokenReduced/
+Output: dataset/ClangReduced/
 """
 
 import os, sys, re, subprocess, signal, tempfile, shutil, hashlib
@@ -25,19 +26,24 @@ import json, time, argparse, multiprocessing, resource
 from datetime import datetime
 from tqdm import tqdm
 
-BASE_DIR     = "/home/user/deadCodeRemover"
-PROJECT_ROOT = os.path.join(BASE_DIR, "IDO_compiler")
+BASE_DIR     = "/home/lukas/code_generator/deadCodeRemover"
+PROJECT_ROOT = os.path.join(BASE_DIR, "IDO_Compiler")
 IDO_DIR      = os.path.abspath(os.path.join(PROJECT_ROOT, "tools", "ido"))
+IDO_CC       = os.path.join(IDO_DIR, "cc")
 
 DATASET_DIR  = os.path.join(BASE_DIR, "dataset")
-INPUT_DIR    = os.path.join(BASE_DIR, "dataset_Stage_3")
-OUTPUT_DIR   = os.path.join(BASE_DIR, "dataset_Stage_4")
+INPUT_DIR    = os.path.join(DATASET_DIR, "Stage_4_IN")
+OUTPUT_DIR   = os.path.join(DATASET_DIR, "Stage_4_OUT")
+HEADERS_DIR    = os.path.join(DATASET_DIR, "Stage_0_headers")
+
 OBJDUMP      = "mips-linux-gnu-objdump"
 TMP_ROOT     = "/dev/shm"
 CLANG_DELTA  = "/usr/local/bin/clang_delta"
 
 GROUPS = [
-    "Input_Group"
+    "Save_00_generated", "Save_01_handwritten", "Save_02_original",
+    "Save_03_Torture", "Save_04_YARPGen", "Save_05_csmith",
+    "Save_06_csmith_switchCase",
 ]
 INCLUDE_DIRS = [
     os.path.join(PROJECT_ROOT, "include"),
@@ -304,7 +310,7 @@ _IDO_ENV = _get_ido_env()
 
 def _get_header_dir(path):
     for g in GROUPS:
-        if g in path: return os.path.join(DATASET_DIR, f"{g}_headers")
+        if g in path: return os.path.join(HEADERS_DIR, f"{g}_headers")
     return ""
 
 def check_disk_space(min_free_gb=2):
@@ -884,7 +890,7 @@ def preprocess_file(c_filepath, header_dir, tmp_dir):
     return pp_path
 
 
-def run_clang_transform(pp_path, transformation, counter, tmp_dir):
+def run_clang_transform(pp_path, transformation, counter, tmp_dir, header_dir=""):
     """Runs a clang_delta transformation."""
     out_path = os.path.join(tmp_dir, "cd_out.c")
     try:
@@ -892,11 +898,19 @@ def run_clang_transform(pp_path, transformation, counter, tmp_dir):
     except OSError:
         pass
 
+    # Append compiler flags after '--' so clang_delta can find headers
     cmd = [CLANG_DELTA,
            f"--transformation={transformation}",
            f"--counter={counter}",
            f"--output={out_path}",
-           pp_path]
+           pp_path,
+           "--",
+           "-D_LANGUAGE_C", "-D_MIPS_SZLONG=32"]
+    for inc in INCLUDE_DIRS:
+        cmd.extend(["-I", inc])
+    if header_dir:
+        cmd.extend(["-I", header_dir])
+
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
     except subprocess.TimeoutExpired:
@@ -907,7 +921,7 @@ def run_clang_transform(pp_path, transformation, counter, tmp_dir):
     return None
 
 
-def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=False):
+def apply_clang_passes(pp_path, baseline_hash, tmp_dir, header_dir, local_cache, verbose=False):
     """Applies only aggregate-to-scalar."""
     changed_total = False
     current_size = os.path.getsize(pp_path)
@@ -929,7 +943,7 @@ def apply_clang_passes(pp_path, baseline_hash, tmp_dir, local_cache, verbose=Fal
             transform_changed = False
 
             while True:
-                out = run_clang_transform(pp_path, transform, counter, tmp_dir)
+                out = run_clang_transform(pp_path, transform, counter, tmp_dir, header_dir)
                 if out is None:
                     break
 
@@ -1361,14 +1375,14 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
             if verbose:
                 print(f"\n  Gatekeeper: Clang needed ({reason})")
 
-            # FIXED: Stage-3 style: try on original source first
+            # FIXED: clang_delta works directly on original source with include paths
             src_copy = os.path.join(tmp_dir, "src_for_clang.c")
             with open(src_copy, "w") as f:
                 f.write(src)
 
             pp_path = src_copy
             local_cache = {}
-            changed = apply_clang_passes(pp_path, baseline, tmp_dir, local_cache, verbose)
+            changed = apply_clang_passes(pp_path, baseline, tmp_dir, header_dir, local_cache, verbose)
 
             if changed:
                 total_changed = True
@@ -1377,31 +1391,8 @@ def reduce_file(c_filepath, header_dir, output_path, dry_run=False, verbose=Fals
                 if verbose:
                     print("  Clang on original source succeeded")
             else:
-                # Fallback: preprocessed only for complex cases (macros etc.)
                 if verbose:
-                    print("  Clang on original source failed, trying preprocessed...")
-                pp_path = preprocess_file(c_filepath, header_dir, tmp_dir)
-                if pp_path is None:
-                    result["status"] = "error"
-                    result["error"] = "Preprocessing failed"
-                    result["compiler_stats"] = cache.stats
-                    return result
-
-                changed = apply_clang_passes(pp_path, baseline, tmp_dir, local_cache, verbose)
-
-                if changed:
-                    total_changed = True
-                    final_hash = compute_asm_hash_from_pp(pp_path, tmp_dir, local_cache)
-                    if final_hash != baseline:
-                        result["status"] = "error"
-                        result["error"] = "Final hash mismatch"
-                        result["compiler_stats"] = cache.stats
-                        return result
-
-                    with open(pp_path) as f:
-                        src = f.read()
-                    if verbose:
-                        print("  Clang on preprocessed source succeeded (output is PP code)")
+                    print("  Clang on original source failed, keeping original.")
 
         result["reduced_lines"] = src.count('\n') + (1 if src and not src.endswith('\n') else 0)
         result["compiler_stats"] = cache.stats
