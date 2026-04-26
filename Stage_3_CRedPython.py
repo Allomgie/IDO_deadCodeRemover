@@ -18,20 +18,21 @@ import json, time, argparse, multiprocessing, resource
 from datetime import datetime
 from tqdm import tqdm
 
-BASE_DIR     = "/home/user/deadCodeRemover"
-PROJECT_ROOT = os.path.join(BASE_DIR, "CompilerRoot")
+BASE_DIR     = "/home/lukas/code_generator/deadCodeRemover"
+PROJECT_ROOT = os.path.join(BASE_DIR, "IDO_Compiler")
 IDO_DIR      = os.path.abspath(os.path.join(PROJECT_ROOT, "tools", "ido"))
 IDO_CC       = os.path.join(IDO_DIR, "cc")
 
-INPUT_DIR    = os.path.join(BASE_DIR, "dataset_Stage_2")
-OUTPUT_DIR   = os.path.join(BASE_DIR, "dataset_Stage_3")
+DATASET_DIR  = os.path.join(BASE_DIR, "dataset")
+INPUT_DIR    = os.path.join(DATASET_DIR, "Stage_3_IN")
+OUTPUT_DIR   = os.path.join(DATASET_DIR, "Stage_3_OUT")
+HEADERS_DIR    = os.path.join(DATASET_DIR, "Stage_0_headers")
+
 OBJDUMP      = "mips-linux-gnu-objdump"
 TMP_ROOT     = "/dev/shm"
 
 GROUPS = [
-    "Save_00_generated", "Save_01_handwritten", "Save_02_original",
-    "Save_03_Torture", "Save_04_YARPGen", "Save_05_csmith",
-    "Save_06_csmith_switchCase",
+    "Input_Group",
 ]
 INCLUDE_DIRS = [
     os.path.join(PROJECT_ROOT, "include"),
@@ -276,7 +277,7 @@ _IDO_ENV = _get_ido_env()
 
 def _get_header_dir(path: str):
     for g in GROUPS:
-        if g in path: return os.path.join(DATASET_DIR, f"{g}_headers")
+        if g in path: return os.path.join(HEADERS_DIR, f"{g}_headers")
     return ""
 
 def check_disk_space(min_free_gb: int = 2):
