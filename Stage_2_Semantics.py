@@ -46,15 +46,16 @@ from pycparser import c_parser, c_generator, c_ast
 
 
 # --- CONFIGURATION ---
-BASE_DIR      = "/home/user/deadCodeRemover"
-PROJECT_ROOT  = os.path.join(BASE_DIR, "CompilerRoot")
+BASE_DIR      = "/home/lukas/code_generator/deadCodeRemover"
+PROJECT_ROOT  = os.path.join(BASE_DIR, "IDO_Compiler")
 IDO_DIR       = os.path.abspath(os.path.join(PROJECT_ROOT, "tools", "ido"))
 IDO_CC        = os.path.join(IDO_DIR, "cc")
 
-# NOTE: Input is the OPTIMISED dataset from Stage 1
+
 DATASET_DIR   = os.path.join(BASE_DIR, "dataset")
-INPUT_DIR     = os.path.join(DATASET_DIR, "dataset_Stage_1")       # Dataset A
-OUTPUT_DIR    = os.path.join(DATASET_DIR, "dataset_Stage_2")  # Dataset B
+INPUT_DIR     = os.path.join(DATASET_DIR, "Stage_2_IN")       
+OUTPUT_DIR    = os.path.join(DATASET_DIR, "Stage_2_OUT") 
+HEADERS_DIR    = os.path.join(DATASET_DIR, "Stage_0_headers")
 
 GROUPS = [
     "Input_Group",
@@ -213,7 +214,7 @@ def compile_to_asm_hash(c_source: str, tmp_dir: str, header_dir: str,
 
 
 # =====================================================================
-#  AST-HELPER
+#  AST HELPERS
 # =====================================================================
 
 def _preprocess_for_parsing(c_source: str, header_dir: str, tmp_dir: str) -> str | None:
@@ -549,7 +550,7 @@ def _rule_self_compare(node):
     if _has_side_effect(node.left) or _has_side_effect(node.right):
         return None
     if _nodes_equal(node.left, node.right):
-        # x == x → 1, x != x → 0, x <= x → 1, x >= x → 1  (unchanged, already English)
+        # x == x → 1, x != x → 0, x <= x → 1, x >= x → 1
         if node.op in ('==', '<=', '>='):
             return c_ast.Constant(type='int', value='1')
         else:  # !=
@@ -728,20 +729,24 @@ def semantic_clean_file(c_filepath: str, header_dir: str,
     tmp_dir = tempfile.mkdtemp(dir=TMP_ROOT, prefix=f"sem_{name_no_ext}_")
 
     try:
-        # Baseline from original
+        # 1. COMPILER CHECK: does the code compile at all?
         baseline_hash, baseline_err = compile_to_asm_hash(
             original_src, tmp_dir, header_dir
         )
         if baseline_hash is None:
             result["status"] = "error"
             result["error"] = f"Baseline compilation failed: {baseline_err}"
+            # DO NOT COPY: file is defective and permanently discarded.
             return result
 
-        # Parse AST
+        # 2. PARSER CHECK: can pycparser read the code?
         ast = _parse_to_ast(original_src, header_dir, tmp_dir)
         if ast is None:
             result["status"] = "error"
             result["error"] = "AST parse failed"
+            # COPY: file compiles cleanly but pycparser fails.
+            if not dry_run:
+                shutil.copy2(c_filepath, output_path)
             return result
 
         # Verify: regenerated code compiles to the same assembly
@@ -749,6 +754,9 @@ def semantic_clean_file(c_filepath: str, header_dir: str,
         if regen_code is None:
             result["status"] = "error"
             result["error"] = "Code regeneration failed"
+            # COPY: file compiles cleanly but regeneration fails.
+            if not dry_run:
+                shutil.copy2(c_filepath, output_path)
             return result
 
         regen_hash, _ = compile_to_asm_hash(regen_code, tmp_dir, header_dir)
@@ -763,7 +771,7 @@ def semantic_clean_file(c_filepath: str, header_dir: str,
         rule_counts = {name: 0 for name, _ in RULES}
         changed = True
         iterations = 0
-        max_iterations = 10  # Safety limit against infinite loops
+        max_iterations = 50  # Safety limit against infinite loops
 
         while changed and iterations < max_iterations:
             iterations += 1
@@ -773,7 +781,7 @@ def semantic_clean_file(c_filepath: str, header_dir: str,
             expr_nodes = _collect_expression_nodes(ast)
 
             for node in expr_nodes:
-                    # Try all rules
+                # Try all rules
                 for rule_name, rule_fn in RULES:
                     try:
                         simplified = rule_fn(node)
@@ -829,15 +837,23 @@ def semantic_clean_file(c_filepath: str, header_dir: str,
     except RecursionError:
         result["status"] = "error"
         result["error"] = "RecursionError"
-        try:
-            shutil.copy2(c_filepath, output_path)
-        except Exception:
-            pass
+        # COPY: file is valid, just too deeply nested for Python.
+        if not dry_run:
+            try:
+                shutil.copy2(c_filepath, output_path)
+            except Exception:
+                pass
         return result
 
     except Exception as e:
         result["status"] = "error"
         result["error"] = str(e)
+        # COPY: an internal script crash must not destroy compilable files.
+        if not dry_run:
+            try:
+                shutil.copy2(c_filepath, output_path)
+            except Exception:
+                pass
         return result
 
     finally:
@@ -861,7 +877,7 @@ def _worker_init():
 def _get_header_dir(c_filepath: str) -> str:
     for group in GROUPS:
         if group in c_filepath:
-            return os.path.join(DATASET_DIR, f"{group}_headers")
+            return os.path.join(HEADERS_DIR, f"{group}_headers")
     return ""
 
 
